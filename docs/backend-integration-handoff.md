@@ -61,9 +61,11 @@ administrator-rotation events use version `3`.
 | `deprecate_asset(asset)` | Admin-authorized transition from active to deprecated; blocks new sessions without changing existing sessions. |
 | `remove_asset(asset)` | Admin-authorized final removal after deprecation and only when recorded liability is exactly zero. |
 | `get_session(session_id)` | Read current session state for API responses, reconciliation, and settlement guards. |
+| `get_session_batch(session_ids)` | Bounded batch read of up to eight caller-supplied IDs with ordered per-item status (`Found(Session)` or `NotFound`). |
 | `get_escrow_liability(asset)` | Read aggregate open-session escrow accounting for a supported asset and compare it with contract token custody. |
 | `settle(session_id, actual_amount, usage_hash)` | Seller-authorized settlement for actual usage. |
 | `cancel(session_id)` | Buyer-authorized cancellation before settlement. |
+| `extend_session_expiry(session_id, new_expires_at_ledger)` | Mutually authorized (buyer and seller) extension of an open, unexpired session expiry within the maximum duration limit. |
 | `recover_expired(session_id)` | Permissionless full refund to the stored buyer at or after expiry. |
 | `recover_expired_batch(session_ids)` | Recover up to eight caller-supplied IDs with ordered per-item results. Missing, premature, terminal, and repeated IDs do not block eligible recoveries. |
 | `extend_ttl(session_id)` | Extend storage TTL for still-open sessions. |

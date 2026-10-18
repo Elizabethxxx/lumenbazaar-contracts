@@ -366,3 +366,138 @@ fn escrow_funding_rejects_an_attacker_authorization() {
     );
     assert_eq!(token::Client::new(&env, &asset).balance(&contract_id), 0);
 }
+
+#[test]
+fn production_expiry_extension_requires_both_buyer_and_seller_authorization_trees() {
+    let env = Env::default();
+    let identities = TestIdentities::generate(&env);
+    identities.assert_distinct();
+    let contract_id = env.register(UptoSessionContract, ());
+    let client = UptoSessionContractClient::new(&env, &contract_id);
+    let asset = create_test_asset(&env, &identities.buyer, 500);
+    let resource_hash = BytesN::from_array(&env, &[51; 32]);
+    let asset_policies = soroban_sdk::vec![
+        &env,
+        AssetPolicy {
+            asset: asset.clone(),
+            max_session_amount: 500,
+        }
+    ];
+
+    client
+        .mock_auths(&[MockAuth {
+            address: &identities.admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "initialize",
+                args: (identities.admin.clone(), asset_policies.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .initialize(&identities.admin, &asset_policies);
+
+    let session_id = client
+        .mock_auths(&[MockAuth {
+            address: &identities.buyer,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "create_session",
+                args: (
+                    identities.buyer.clone(),
+                    identities.seller.clone(),
+                    asset.clone(),
+                    500_i128,
+                    50_u32,
+                    resource_hash.clone(),
+                )
+                    .into_val(&env),
+                sub_invokes: &[MockAuthInvoke {
+                    contract: &asset,
+                    fn_name: "transfer",
+                    args: (
+                        identities.buyer.clone(),
+                        contract_id.clone(),
+                        500_i128,
+                    )
+                        .into_val(&env),
+                    sub_invokes: &[],
+                }],
+            },
+        }])
+        .create_session(
+            &identities.buyer,
+            &identities.seller,
+            &asset,
+            &500,
+            &50,
+            &resource_hash,
+        );
+
+    // Mutual extension: both buyer and seller authorize
+    client
+        .mock_auths(&[
+            MockAuth {
+                address: &identities.buyer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "extend_session_expiry",
+                    args: (session_id.clone(), 80_u32).into_val(&env),
+                    sub_invokes: &[],
+                },
+            },
+            MockAuth {
+                address: &identities.seller,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "extend_session_expiry",
+                    args: (session_id.clone(), 80_u32).into_val(&env),
+                    sub_invokes: &[],
+                },
+            },
+        ])
+        .extend_session_expiry(&session_id, &80);
+
+    assert_eq!(client.get_session(&session_id).expires_at_ledger, 80);
+
+    // Attacker only authorization is rejected
+    let attacker_res = client
+        .mock_auths(&[MockAuth {
+            address: &identities.attacker,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "extend_session_expiry",
+                args: (session_id.clone(), 100_u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_extend_session_expiry(&session_id, &100);
+    assert!(attacker_res.is_err());
+
+    // Buyer only authorization is rejected
+    let buyer_only_res = client
+        .mock_auths(&[MockAuth {
+            address: &identities.buyer,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "extend_session_expiry",
+                args: (session_id.clone(), 100_u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_extend_session_expiry(&session_id, &100);
+    assert!(buyer_only_res.is_err());
+
+    // Seller only authorization is rejected
+    let seller_only_res = client
+        .mock_auths(&[MockAuth {
+            address: &identities.seller,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "extend_session_expiry",
+                args: (session_id.clone(), 100_u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_extend_session_expiry(&session_id, &100);
+    assert!(seller_only_res.is_err());
+}

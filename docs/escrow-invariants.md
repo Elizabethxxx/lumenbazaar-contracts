@@ -31,7 +31,10 @@ Cancellation is available only before expiry. At the exact expiry ledger and
 afterward, `recover_expired` is permissionless but has no recipient or amount
 arguments: it always refunds the complete escrow to the stored buyer and marks
 the session `Expired`. Settlement, cancellation, and recovery are mutually
-exclusive terminal paths.
+exclusive terminal paths. Mutual session expiry extension (`extend_session_expiry`)
+requires both buyer and seller authorization and strictly advances the expiry ledger
+forward within the bounded max duration while the session remains open, leaving escrow
+liability and deposited balances unchanged.
 
 Before either terminal transfer, the contract checks that the stored open
 session still carries its complete cap and that the contract token balance
@@ -87,4 +90,5 @@ model action to implementation and test evidence that must remain green.
 | `Settle` | `settle`, seller authorization, amount and expiry validation, liability decrease | `settle_rejects_wrong_seller_auth`, `settle_accepts_exact_cap_without_refund`, `settlement_isolates_concurrent_sessions_sharing_an_asset` |
 | `Cancel` | `cancel`, buyer authorization, pre-expiry gate, full refund | `cancel_requires_buyer_auth`, `cancel_allows_buyer_cancellation_before_settlement`, `cancel_rejects_already_cancelled_session` |
 | `AdvanceToExpiry` | ledger sequence compared with `expires_at_ledger` | `expiry_boundary_selects_exactly_one_terminal_path` |
+| `ExtendExpiry` | `extend_session_expiry`, buyer & seller authorization, pre-expiry & max-duration gates | `extend_session_expiry_succeeds_and_emits_event`, `production_expiry_extension_requires_both_buyer_and_seller_authorization_trees` |
 | `Recover` | `recover_expired`, fixed stored buyer recipient, full refund | `expiry_recovery_is_permissionless_fixed_recipient_and_single_use`, `expiry_recovery_rejects_missing_settled_and_cancelled_sessions` |

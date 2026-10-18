@@ -38,14 +38,10 @@ fn set_standard_policy(
     asset: &Address,
     resource_hash: &BytesN<32>,
 ) {
-    client.set_policy(&standard_policy(
-        env,
-        agent,
-        seller,
-        asset,
-        resource_hash,
-        100,
-    ));
+    client.set_policy(
+        &standard_policy(env, agent, seller, asset, resource_hash, 100),
+        &0,
+    );
 }
 
 fn standard_policy(
@@ -64,6 +60,7 @@ fn standard_policy(
         allowed_sellers: vec![env, seller.clone()],
         allowed_assets: vec![env, asset.clone()],
         allowed_resource_hashes: vec![env, resource_hash.clone()],
+        revision: 0,
     }
 }
 
@@ -179,6 +176,7 @@ fn owner_sets_spending_policy() {
     assert_eq!(policy.allowed_sellers, vec![&env, seller]);
     assert_eq!(policy.allowed_assets, vec![&env, asset]);
     assert_eq!(policy.allowed_resource_hashes, vec![&env, resource_hash]);
+    assert_eq!(policy.revision, 1);
 }
 
 #[test]
@@ -257,27 +255,35 @@ fn rejects_invalid_or_expired_policy_windows() {
     let (client, agent, seller, asset, _owner, resource_hash) = initialized_wallet(&env);
 
     assert_eq!(
-        client.try_set_policy(&SpendingPolicy {
-            agent: agent.clone(),
-            max_amount_per_payment: 0,
-            max_amount_per_day: 100,
-            valid_until_ledger: 100,
-            allowed_sellers: vec![&env, seller.clone()],
-            allowed_assets: vec![&env, asset.clone()],
-            allowed_resource_hashes: vec![&env, resource_hash.clone()],
-        }),
+        client.try_set_policy(
+            &SpendingPolicy {
+                agent: agent.clone(),
+                max_amount_per_payment: 0,
+                max_amount_per_day: 100,
+                valid_until_ledger: 100,
+                allowed_sellers: vec![&env, seller.clone()],
+                allowed_assets: vec![&env, asset.clone()],
+                allowed_resource_hashes: vec![&env, resource_hash.clone()],
+                revision: 0,
+            },
+            &0
+        ),
         Err(Ok(PolicyWalletError::InvalidPolicy))
     );
     assert_eq!(
-        client.try_set_policy(&SpendingPolicy {
-            agent,
-            max_amount_per_payment: 10,
-            max_amount_per_day: 100,
-            valid_until_ledger: 0,
-            allowed_sellers: vec![&env, seller],
-            allowed_assets: vec![&env, asset],
-            allowed_resource_hashes: vec![&env, resource_hash],
-        }),
+        client.try_set_policy(
+            &SpendingPolicy {
+                agent,
+                max_amount_per_payment: 10,
+                max_amount_per_day: 100,
+                valid_until_ledger: 0,
+                allowed_sellers: vec![&env, seller],
+                allowed_assets: vec![&env, asset],
+                allowed_resource_hashes: vec![&env, resource_hash],
+                revision: 0,
+            },
+            &0
+        ),
         Err(Ok(PolicyWalletError::PolicyExpired))
     );
 }
@@ -313,14 +319,10 @@ fn documentation_expired_policy_example_reports_expired() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, agent, seller, asset, _owner, resource_hash) = initialized_wallet(&env);
-    client.set_policy(&standard_policy(
-        &env,
-        &agent,
-        &seller,
-        &asset,
-        &resource_hash,
-        10,
-    ));
+    client.set_policy(
+        &standard_policy(&env, &agent, &seller, &asset, &resource_hash, 10),
+        &0,
+    );
 
     env.ledger().set_sequence_number(11);
 
@@ -356,4 +358,322 @@ fn documentation_wrong_asset_example_reports_asset_error() {
         client.try_check_payment(&agent, &seller, &wrong_asset, &50, &resource_hash),
         Err(Ok(PolicyWalletError::AssetNotAllowed))
     );
+}
+
+#[test]
+fn policy_creation_and_update_follow_deterministic_revisions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, agent, seller, asset, _owner, resource_hash) = initialized_wallet(&env);
+
+    // Initial policy creation with expected_revision 0
+    let mut policy = standard_policy(&env, &agent, &seller, &asset, &resource_hash, 100);
+    client.set_policy(&policy, &0);
+
+    let stored = client.get_policy(&agent);
+    assert_eq!(stored.revision, 1);
+    assert_eq!(client.get_policy_revision(&agent), 1);
+
+    // Update with expected_revision 1 advances to 2
+    policy.max_amount_per_payment = 80;
+    client.set_policy(&policy, &1);
+
+    let updated = client.get_policy(&agent);
+    assert_eq!(updated.revision, 2);
+    assert_eq!(updated.max_amount_per_payment, 80);
+    assert_eq!(client.get_policy_revision(&agent), 2);
+}
+
+#[test]
+fn stale_expected_revision_fails_without_modifying_policy_or_spend() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, agent, seller, asset, _owner, resource_hash) = initialized_wallet(&env);
+
+    let mut policy = standard_policy(&env, &agent, &seller, &asset, &resource_hash, 100);
+    client.set_policy(&policy, &0);
+
+    // Authorize payment to set spend state
+    client.authorize_payment(&agent, &seller, &asset, &20, &resource_hash);
+    assert_eq!(client.spent_today(&agent), 20);
+
+    // Attempt stale write with expected_revision 0
+    policy.max_amount_per_payment = 90;
+    let res = client.try_set_policy(&policy, &0);
+    assert_eq!(res, Err(Ok(PolicyWalletError::StaleRevision)));
+
+    // Policy and spend remain unchanged
+    let stored = client.get_policy(&agent);
+    assert_eq!(stored.revision, 1);
+    assert_eq!(stored.max_amount_per_payment, 75);
+    assert_eq!(client.spent_today(&agent), 20);
+
+    // Attempt future stale revision (e.g. 99)
+    let res_future = client.try_set_policy(&policy, &99);
+    assert_eq!(res_future, Err(Ok(PolicyWalletError::StaleRevision)));
+    assert_eq!(client.get_policy(&agent).revision, 1);
+}
+
+#[test]
+fn concurrent_tooling_conflicts_are_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, agent, seller, asset, _owner, resource_hash) = initialized_wallet(&env);
+
+    let policy_init = standard_policy(&env, &agent, &seller, &asset, &resource_hash, 100);
+    client.set_policy(&policy_init, &0);
+
+    // Both Tooling A and Tooling B observe revision 1
+    let rev_a = client.get_policy_revision(&agent);
+    let rev_b = client.get_policy_revision(&agent);
+    assert_eq!(rev_a, 1);
+    assert_eq!(rev_b, 1);
+
+    // Tooling A updates first
+    let mut policy_a = policy_init.clone();
+    policy_a.max_amount_per_payment = 60;
+    assert!(client.try_set_policy(&policy_a, &rev_a).is_ok());
+
+    // Tooling B tries to update using its stale view (revision 1)
+    let mut policy_b = policy_init.clone();
+    policy_b.max_amount_per_payment = 70;
+    assert_eq!(
+        client.try_set_policy(&policy_b, &rev_b),
+        Err(Ok(PolicyWalletError::StaleRevision))
+    );
+
+    // Tooling A's policy is active
+    let stored = client.get_policy(&agent);
+    assert_eq!(stored.revision, 2);
+    assert_eq!(stored.max_amount_per_payment, 60);
+}
+
+#[test]
+fn independent_agents_have_isolated_policy_revisions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, agent1, seller, asset, _owner, resource_hash) = initialized_wallet(&env);
+    let agent2 = Address::generate(&env);
+
+    let policy1 = standard_policy(&env, &agent1, &seller, &asset, &resource_hash, 100);
+    let policy2 = standard_policy(&env, &agent2, &seller, &asset, &resource_hash, 100);
+
+    client.set_policy(&policy1, &0);
+    client.set_policy(&policy2, &0);
+
+    assert_eq!(client.get_policy_revision(&agent1), 1);
+    assert_eq!(client.get_policy_revision(&agent2), 1);
+
+    // Update agent1 multiple times
+    let mut p1_update = policy1.clone();
+    p1_update.max_amount_per_payment = 50;
+    client.set_policy(&p1_update, &1);
+    p1_update.max_amount_per_payment = 40;
+    client.set_policy(&p1_update, &2);
+
+    assert_eq!(client.get_policy_revision(&agent1), 3);
+    assert_eq!(client.get_policy_revision(&agent2), 1);
+}
+
+#[test]
+fn distinct_create_path_creates_policy_and_rejects_existing() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, agent, seller, asset, _owner, resource_hash) = initialized_wallet(&env);
+
+    let policy = standard_policy(&env, &agent, &seller, &asset, &resource_hash, 100);
+    assert!(client.try_create_policy(&policy).is_ok());
+    assert_eq!(client.get_policy_revision(&agent), 1);
+
+    // Calling create_policy again on existing policy fails with StaleRevision
+    assert_eq!(
+        client.try_create_policy(&policy),
+        Err(Ok(PolicyWalletError::StaleRevision))
+    );
+}
+
+#[test]
+fn allowlists_enforce_exact_limits_and_fail_at_limit_plus_one() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, agent, _seller, _asset, _owner, _resource_hash) = initialized_wallet(&env);
+
+    // Exact limits (16 items each) pass
+    let mut sellers_max = vec![&env];
+    for _ in 0..MAX_ALLOWED_SELLERS {
+        sellers_max.push_back(Address::generate(&env));
+    }
+    let mut assets_max = vec![&env];
+    for _ in 0..MAX_ALLOWED_ASSETS {
+        assets_max.push_back(Address::generate(&env));
+    }
+    let mut hashes_max = vec![&env];
+    for i in 0..MAX_ALLOWED_RESOURCE_HASHES {
+        hashes_max.push_back(BytesN::from_array(&env, &[(i + 1) as u8; 32]));
+    }
+
+    let exact_policy = SpendingPolicy {
+        agent: agent.clone(),
+        max_amount_per_payment: 50,
+        max_amount_per_day: 100,
+        valid_until_ledger: 100,
+        allowed_sellers: sellers_max.clone(),
+        allowed_assets: assets_max.clone(),
+        allowed_resource_hashes: hashes_max.clone(),
+        revision: 0,
+    };
+    assert!(client.try_set_policy(&exact_policy, &0).is_ok());
+
+    let agent_oversized = Address::generate(&env);
+
+    // Sellers limit + 1 fails
+    let mut sellers_oversized = sellers_max.clone();
+    sellers_oversized.push_back(Address::generate(&env));
+    let mut p_sellers_over = exact_policy.clone();
+    p_sellers_over.agent = agent_oversized.clone();
+    p_sellers_over.allowed_sellers = sellers_oversized;
+    assert_eq!(
+        client.try_set_policy(&p_sellers_over, &0),
+        Err(Ok(PolicyWalletError::InvalidPolicy))
+    );
+
+    // Assets limit + 1 fails
+    let mut assets_oversized = assets_max.clone();
+    assets_oversized.push_back(Address::generate(&env));
+    let mut p_assets_over = exact_policy.clone();
+    p_assets_over.agent = agent_oversized.clone();
+    p_assets_over.allowed_assets = assets_oversized;
+    assert_eq!(
+        client.try_set_policy(&p_assets_over, &0),
+        Err(Ok(PolicyWalletError::InvalidPolicy))
+    );
+
+    // Hashes limit + 1 fails
+    let mut hashes_oversized = hashes_max.clone();
+    hashes_oversized.push_back(BytesN::from_array(&env, &[99; 32]));
+    let mut p_hashes_over = exact_policy.clone();
+    p_hashes_over.agent = agent_oversized.clone();
+    p_hashes_over.allowed_resource_hashes = hashes_oversized;
+    assert_eq!(
+        client.try_set_policy(&p_hashes_over, &0),
+        Err(Ok(PolicyWalletError::InvalidPolicy))
+    );
+}
+
+#[test]
+fn allowlists_reject_duplicate_sellers_deterministically() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, agent, seller, asset, _owner, resource_hash) = initialized_wallet(&env);
+
+    let dup_policy = SpendingPolicy {
+        agent,
+        max_amount_per_payment: 50,
+        max_amount_per_day: 100,
+        valid_until_ledger: 100,
+        allowed_sellers: vec![&env, seller.clone(), seller],
+        allowed_assets: vec![&env, asset],
+        allowed_resource_hashes: vec![&env, resource_hash],
+        revision: 0,
+    };
+    assert_eq!(
+        client.try_set_policy(&dup_policy, &0),
+        Err(Ok(PolicyWalletError::InvalidPolicy))
+    );
+}
+
+#[test]
+fn allowlists_reject_duplicate_assets_deterministically() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, agent, seller, asset, _owner, resource_hash) = initialized_wallet(&env);
+
+    let dup_policy = SpendingPolicy {
+        agent,
+        max_amount_per_payment: 50,
+        max_amount_per_day: 100,
+        valid_until_ledger: 100,
+        allowed_sellers: vec![&env, seller],
+        allowed_assets: vec![&env, asset.clone(), asset],
+        allowed_resource_hashes: vec![&env, resource_hash],
+        revision: 0,
+    };
+    assert_eq!(
+        client.try_set_policy(&dup_policy, &0),
+        Err(Ok(PolicyWalletError::InvalidPolicy))
+    );
+}
+
+#[test]
+fn allowlists_reject_duplicate_resource_hashes_deterministically() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, agent, seller, asset, _owner, resource_hash) = initialized_wallet(&env);
+
+    let dup_policy = SpendingPolicy {
+        agent,
+        max_amount_per_payment: 50,
+        max_amount_per_day: 100,
+        valid_until_ledger: 100,
+        allowed_sellers: vec![&env, seller],
+        allowed_assets: vec![&env, asset],
+        allowed_resource_hashes: vec![&env, resource_hash.clone(), resource_hash],
+        revision: 0,
+    };
+    assert_eq!(
+        client.try_set_policy(&dup_policy, &0),
+        Err(Ok(PolicyWalletError::InvalidPolicy))
+    );
+}
+
+#[test]
+fn validation_failures_perform_no_storage_write_and_have_bounded_resource_usage() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, agent, seller, asset, _owner, resource_hash) = initialized_wallet(&env);
+
+    let invalid_policy = SpendingPolicy {
+        agent: agent.clone(),
+        max_amount_per_payment: 50,
+        max_amount_per_day: 100,
+        valid_until_ledger: 100,
+        allowed_sellers: vec![&env, seller.clone(), seller],
+        allowed_assets: vec![&env, asset],
+        allowed_resource_hashes: vec![&env, resource_hash],
+        revision: 0,
+    };
+
+    let result = client.try_set_policy(&invalid_policy, &0);
+    assert_eq!(result, Err(Ok(PolicyWalletError::InvalidPolicy)));
+
+    // Policy was NOT stored
+    assert_eq!(
+        client.try_get_policy(&agent),
+        Err(Ok(PolicyWalletError::PolicyNotFound))
+    );
+
+    let resources = env.cost_estimate().resources();
+    assert!(resources.instructions > 0);
+    assert!(resources.mem_bytes > 0);
+    assert_eq!(resources.write_entries, 0);
+    assert_eq!(resources.write_bytes, 0);
+}
+
+#[test]
+fn revision_advancement_is_overflow_safe() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, agent, seller, asset, _owner, resource_hash) = initialized_wallet(&env);
+
+    let mut policy = standard_policy(&env, &agent, &seller, &asset, &resource_hash, 100);
+    policy.revision = u32::MAX;
+
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::Policy(agent.clone()), &policy);
+    });
+
+    let res = client.try_set_policy(&policy, &u32::MAX);
+    assert_eq!(res, Err(Ok(PolicyWalletError::RevisionOverflow)));
 }

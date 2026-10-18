@@ -3046,3 +3046,509 @@ fn extend_ttl_rejects_missing_session() {
         Err(Ok(ContractError::SessionNotFound))
     );
 }
+
+#[test]
+fn get_session_batch_preserves_request_order_and_mixed_statuses() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(UptoSessionContract, ());
+    let client = UptoSessionContractClient::new(&env, &contract_id);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let asset = create_test_asset(&env, &buyer, 1000);
+    initialize_for_asset(&env, &client, &buyer, &asset);
+
+    let open_id = client.create_session(
+        &buyer,
+        &seller,
+        &asset,
+        &100,
+        &30,
+        &BytesN::from_array(&env, &[81; 32]),
+    );
+    let cancelled_id = client.create_session(
+        &buyer,
+        &seller,
+        &asset,
+        &100,
+        &30,
+        &BytesN::from_array(&env, &[82; 32]),
+    );
+    client.cancel(&cancelled_id);
+
+    let settled_id = client.create_session(
+        &buyer,
+        &seller,
+        &asset,
+        &100,
+        &30,
+        &BytesN::from_array(&env, &[83; 32]),
+    );
+    client.settle(&settled_id, &40, &BytesN::from_array(&env, &[84; 32]));
+
+    let expired_id = client.create_session(
+        &buyer,
+        &seller,
+        &asset,
+        &100,
+        &5,
+        &BytesN::from_array(&env, &[85; 32]),
+    );
+    env.ledger().set_sequence_number(10);
+    client.recover_expired(&expired_id);
+
+    let missing_first = BytesN::from_array(&env, &[86; 32]);
+    let missing_second = BytesN::from_array(&env, &[87; 32]);
+
+    let open_session = client.get_session(&open_id);
+    let cancelled_session = client.get_session(&cancelled_id);
+    let settled_session = client.get_session(&settled_id);
+    let expired_session = client.get_session(&expired_id);
+
+    let results = client.get_session_batch(&soroban_sdk::vec![
+        &env,
+        open_id.clone(),
+        missing_first.clone(),
+        open_id.clone(),
+        cancelled_id.clone(),
+        settled_id.clone(),
+        expired_id.clone(),
+        missing_second.clone(),
+        missing_first.clone(),
+    ]);
+
+    assert_eq!(
+        results,
+        soroban_sdk::vec![
+            &env,
+            BatchSessionResult {
+                session_id: open_id.clone(),
+                status: BatchSessionStatus::Found(open_session.clone()),
+            },
+            BatchSessionResult {
+                session_id: missing_first.clone(),
+                status: BatchSessionStatus::NotFound,
+            },
+            BatchSessionResult {
+                session_id: open_id,
+                status: BatchSessionStatus::Found(open_session),
+            },
+            BatchSessionResult {
+                session_id: cancelled_id,
+                status: BatchSessionStatus::Found(cancelled_session),
+            },
+            BatchSessionResult {
+                session_id: settled_id,
+                status: BatchSessionStatus::Found(settled_session),
+            },
+            BatchSessionResult {
+                session_id: expired_id,
+                status: BatchSessionStatus::Found(expired_session),
+            },
+            BatchSessionResult {
+                session_id: missing_second,
+                status: BatchSessionStatus::NotFound,
+            },
+            BatchSessionResult {
+                session_id: missing_first,
+                status: BatchSessionStatus::NotFound,
+            },
+        ]
+    );
+}
+
+#[test]
+fn get_session_batch_enforces_nonzero_and_max_batch_size_bounds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(UptoSessionContract, ());
+    let client = UptoSessionContractClient::new(&env, &contract_id);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let asset = create_test_asset(&env, &buyer, 1000);
+    initialize_for_asset(&env, &client, &buyer, &asset);
+
+    assert_eq!(
+        client.try_get_session_batch(&soroban_sdk::vec![&env]),
+        Err(Ok(ContractError::InvalidBatchSize))
+    );
+
+    let mut max_batch = soroban_sdk::Vec::new(&env);
+    for idx in 0..MAX_SESSION_QUERY_BATCH_SIZE {
+        let id = client.create_session(
+            &buyer,
+            &seller,
+            &asset,
+            &100,
+            &30,
+            &BytesN::from_array(&env, &[(90 + idx) as u8; 32]),
+        );
+        max_batch.push_back(id);
+    }
+
+    let max_results = client.get_session_batch(&max_batch);
+    assert_eq!(max_results.len(), MAX_SESSION_QUERY_BATCH_SIZE);
+    assert!(max_results
+        .iter()
+        .all(|item| matches!(item.status, BatchSessionStatus::Found(_))));
+
+    let mut oversized = max_batch.clone();
+    oversized.push_back(BytesN::from_array(&env, &[99; 32]));
+    assert_eq!(
+        client.try_get_session_batch(&oversized),
+        Err(Ok(ContractError::InvalidBatchSize))
+    );
+
+    let mut oversized_duplicates = soroban_sdk::Vec::new(&env);
+    let repeated_id = max_batch.get(0).unwrap();
+    for _ in 0..=MAX_SESSION_QUERY_BATCH_SIZE {
+        oversized_duplicates.push_back(repeated_id.clone());
+    }
+    assert_eq!(
+        client.try_get_session_batch(&oversized_duplicates),
+        Err(Ok(ContractError::InvalidBatchSize))
+    );
+}
+
+#[test]
+fn get_session_batch_resource_usage_is_read_only_and_bounded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(UptoSessionContract, ());
+    let client = UptoSessionContractClient::new(&env, &contract_id);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let asset = create_test_asset(&env, &buyer, 1000);
+    initialize_for_asset(&env, &client, &buyer, &asset);
+
+    let mut batch_ids = soroban_sdk::Vec::new(&env);
+    for idx in 0..MAX_SESSION_QUERY_BATCH_SIZE {
+        let session_id = client.create_session(
+            &buyer,
+            &seller,
+            &asset,
+            &100,
+            &50,
+            &BytesN::from_array(&env, &[(110 + idx) as u8; 32]),
+        );
+        batch_ids.push_back(session_id);
+    }
+
+    let results = client.get_session_batch(&batch_ids);
+    assert_eq!(results.len(), MAX_SESSION_QUERY_BATCH_SIZE);
+
+    let resources = env.cost_estimate().resources();
+    let fee = env.cost_estimate().fee();
+    assert!(resources.instructions > 0);
+    assert!(resources.mem_bytes > 0);
+    assert_eq!(resources.write_entries, 0);
+    assert_eq!(resources.write_bytes, 0);
+    assert_eq!(resources.contract_events_size_bytes, 0);
+    assert_eq!(resources.persistent_entry_rent_bumps, 0);
+    assert!(fee.total > 0);
+    assert!(env.auths().is_empty());
+}
+
+#[test]
+fn get_session_batch_available_across_operational_states() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(UptoSessionContract, ());
+    let client = UptoSessionContractClient::new(&env, &contract_id);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let asset = create_test_asset(&env, &buyer, 500);
+    initialize_for_asset(&env, &client, &buyer, &asset);
+
+    let session_id = client.create_session(
+        &buyer,
+        &seller,
+        &asset,
+        &100,
+        &50,
+        &BytesN::from_array(&env, &[120; 32]),
+    );
+
+    for state in [
+        OperationalState::Active,
+        OperationalState::Paused,
+        OperationalState::Deprecated,
+    ] {
+        env.as_contract(&contract_id, || {
+            storage::write_operational_state(&env, &state);
+        });
+        let batch = client.get_session_batch(&soroban_sdk::vec![&env, session_id.clone()]);
+        assert_eq!(batch.len(), 1);
+        assert!(matches!(
+            batch.get(0).unwrap().status,
+            BatchSessionStatus::Found(_)
+        ));
+    }
+}
+
+#[test]
+fn extend_session_expiry_succeeds_and_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(UptoSessionContract, ());
+    let client = UptoSessionContractClient::new(&env, &contract_id);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let asset = create_test_asset(&env, &buyer, 500);
+    initialize_for_asset(&env, &client, &buyer, &asset);
+
+    let resource_hash = BytesN::from_array(&env, &[130; 32]);
+    let session_id = client.create_session(&buyer, &seller, &asset, &100, &30, &resource_hash);
+
+    assert!(client.try_extend_session_expiry(&session_id, &50).is_ok());
+
+    // Verify SessionExpiryExtended event
+    assert_eq!(
+        env.events().all().filter_by_contract(&contract_id),
+        std::vec![events::SessionExpiryExtended {
+            session_id: session_id.clone(),
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            previous_expires_at_ledger: 30,
+            new_expires_at_ledger: 50,
+            event_version: 2,
+        }
+        .to_xdr(&env, &contract_id)]
+    );
+
+    let session = client.get_session(&session_id);
+    assert_eq!(session.expires_at_ledger, 50);
+    assert_eq!(session.max_amount, 100);
+    assert_eq!(session.escrowed_amount, 100);
+    assert_eq!(session.settled_amount, 0);
+    assert_eq!(session.resource_hash, resource_hash);
+    assert_eq!(session.status, SessionStatus::Open);
+}
+
+#[test]
+fn extend_session_expiry_allows_multiple_consecutive_extensions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(UptoSessionContract, ());
+    let client = UptoSessionContractClient::new(&env, &contract_id);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let asset = create_test_asset(&env, &buyer, 500);
+    initialize_for_asset(&env, &client, &buyer, &asset);
+
+    let session_id = client.create_session(
+        &buyer,
+        &seller,
+        &asset,
+        &100,
+        &30,
+        &BytesN::from_array(&env, &[131; 32]),
+    );
+
+    assert!(client.try_extend_session_expiry(&session_id, &50).is_ok());
+    assert_eq!(client.get_session(&session_id).expires_at_ledger, 50);
+
+    assert!(client.try_extend_session_expiry(&session_id, &80).is_ok());
+    assert_eq!(client.get_session(&session_id).expires_at_ledger, 80);
+}
+
+#[test]
+fn extend_session_expiry_rejects_missing_session() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(UptoSessionContract, ());
+    let client = UptoSessionContractClient::new(&env, &contract_id);
+    let missing_id = BytesN::from_array(&env, &[132; 32]);
+
+    assert_eq!(
+        client.try_extend_session_expiry(&missing_id, &100),
+        Err(Ok(ContractError::SessionNotFound))
+    );
+}
+
+#[test]
+fn extend_session_expiry_rejects_terminal_sessions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(UptoSessionContract, ());
+    let client = UptoSessionContractClient::new(&env, &contract_id);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let asset = create_test_asset(&env, &buyer, 800);
+    initialize_for_asset(&env, &client, &buyer, &asset);
+
+    // Cancelled session
+    let cancelled_id = client.create_session(
+        &buyer,
+        &seller,
+        &asset,
+        &100,
+        &30,
+        &BytesN::from_array(&env, &[133; 32]),
+    );
+    client.cancel(&cancelled_id);
+    assert_eq!(
+        client.try_extend_session_expiry(&cancelled_id, &50),
+        Err(Ok(ContractError::SessionCancelled))
+    );
+
+    // Settled session
+    let settled_id = client.create_session(
+        &buyer,
+        &seller,
+        &asset,
+        &100,
+        &30,
+        &BytesN::from_array(&env, &[134; 32]),
+    );
+    client.settle(&settled_id, &50, &BytesN::from_array(&env, &[135; 32]));
+    assert_eq!(
+        client.try_extend_session_expiry(&settled_id, &50),
+        Err(Ok(ContractError::SessionAlreadySettled))
+    );
+
+    // Expired session
+    let expired_id = client.create_session(
+        &buyer,
+        &seller,
+        &asset,
+        &100,
+        &10,
+        &BytesN::from_array(&env, &[136; 32]),
+    );
+    env.ledger().set_sequence_number(15);
+    client.recover_expired(&expired_id);
+    assert_eq!(
+        client.try_extend_session_expiry(&expired_id, &50),
+        Err(Ok(ContractError::SessionExpired))
+    );
+}
+
+#[test]
+fn extend_session_expiry_rejects_past_or_current_expiry_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(UptoSessionContract, ());
+    let client = UptoSessionContractClient::new(&env, &contract_id);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let asset = create_test_asset(&env, &buyer, 500);
+    initialize_for_asset(&env, &client, &buyer, &asset);
+
+    let session_id = client.create_session(
+        &buyer,
+        &seller,
+        &asset,
+        &100,
+        &30,
+        &BytesN::from_array(&env, &[137; 32]),
+    );
+
+    // Exactly at expiry ledger 30: extension is rejected
+    env.ledger().set_sequence_number(30);
+    assert_eq!(
+        client.try_extend_session_expiry(&session_id, &50),
+        Err(Ok(ContractError::ExpiredSession))
+    );
+
+    // Past expiry ledger 35: extension is rejected
+    env.ledger().set_sequence_number(35);
+    assert_eq!(
+        client.try_extend_session_expiry(&session_id, &50),
+        Err(Ok(ContractError::ExpiredSession))
+    );
+}
+
+#[test]
+fn extend_session_expiry_succeeds_at_last_open_ledger() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(UptoSessionContract, ());
+    let client = UptoSessionContractClient::new(&env, &contract_id);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let asset = create_test_asset(&env, &buyer, 500);
+    initialize_for_asset(&env, &client, &buyer, &asset);
+
+    let session_id = client.create_session(
+        &buyer,
+        &seller,
+        &asset,
+        &100,
+        &30,
+        &BytesN::from_array(&env, &[138; 32]),
+    );
+
+    // Ledger 29 is the last ledger before expiry 30: extension succeeds!
+    env.ledger().set_sequence_number(29);
+    assert!(client.try_extend_session_expiry(&session_id, &50).is_ok());
+    assert_eq!(client.get_session(&session_id).expires_at_ledger, 50);
+}
+
+#[test]
+fn extend_session_expiry_rejects_non_increasing_expiry() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(UptoSessionContract, ());
+    let client = UptoSessionContractClient::new(&env, &contract_id);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let asset = create_test_asset(&env, &buyer, 500);
+    initialize_for_asset(&env, &client, &buyer, &asset);
+
+    let session_id = client.create_session(
+        &buyer,
+        &seller,
+        &asset,
+        &100,
+        &30,
+        &BytesN::from_array(&env, &[139; 32]),
+    );
+
+    // Same expiry (30) fails
+    assert_eq!(
+        client.try_extend_session_expiry(&session_id, &30),
+        Err(Ok(ContractError::ExpiredSession))
+    );
+
+    // Earlier expiry (20) fails
+    assert_eq!(
+        client.try_extend_session_expiry(&session_id, &20),
+        Err(Ok(ContractError::ExpiredSession))
+    );
+}
+
+#[test]
+fn extend_session_expiry_rejects_exceeding_max_session_duration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(UptoSessionContract, ());
+    let client = UptoSessionContractClient::new(&env, &contract_id);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let asset = create_test_asset(&env, &buyer, 500);
+    initialize_for_asset(&env, &client, &buyer, &asset);
+
+    let session_id = client.create_session(
+        &buyer,
+        &seller,
+        &asset,
+        &100,
+        &30,
+        &BytesN::from_array(&env, &[140; 32]),
+    );
+
+    let current_ledger = env.ledger().sequence();
+    let max_allowed = current_ledger + validation::MAX_SESSION_DURATION_LEDGERS;
+
+    // Exact max allowed succeeds
+    assert!(client
+        .try_extend_session_expiry(&session_id, &max_allowed)
+        .is_ok());
+
+    // Max allowed + 1 fails
+    assert_eq!(
+        client.try_extend_session_expiry(&session_id, &(max_allowed + 1)),
+        Err(Ok(ContractError::SessionDurationTooLong))
+    );
+}

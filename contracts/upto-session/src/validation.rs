@@ -126,6 +126,27 @@ pub fn validate_usage_hash(env: &Env, usage_hash: &BytesN<32>) -> Result<(), Con
     Ok(())
 }
 
+pub fn validate_expiry_extension(
+    env: &Env,
+    session: &Session,
+    new_expires_at_ledger: u32,
+) -> Result<(), ContractError> {
+    let current_ledger = env.ledger().sequence();
+    if current_ledger >= session.expires_at_ledger {
+        return Err(ContractError::ExpiredSession);
+    }
+    if new_expires_at_ledger <= session.expires_at_ledger {
+        return Err(ContractError::ExpiredSession);
+    }
+    let duration = new_expires_at_ledger
+        .checked_sub(current_ledger)
+        .ok_or(ContractError::ExpiredSession)?;
+    if duration > MAX_SESSION_DURATION_LEDGERS {
+        return Err(ContractError::SessionDurationTooLong);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -315,6 +336,59 @@ mod tests {
         assert_eq!(
             validate_usage_hash(&env, &empty_hash),
             Err(ContractError::InvalidUsageHash)
+        );
+    }
+
+    #[test]
+    fn validates_expiry_extension_boundaries() {
+        let env = Env::default();
+        env.ledger().set_sequence_number(50);
+        let (buyer, seller, asset, resource_hash) = valid_inputs(&env);
+        let session = Session {
+            id: BytesN::from_array(&env, &[1; 32]),
+            buyer,
+            seller,
+            asset,
+            max_amount: 100,
+            escrowed_amount: 100,
+            settled_amount: 0,
+            expires_at_ledger: 100,
+            resource_hash,
+            usage_hash: None,
+            status: crate::SessionStatus::Open,
+        };
+
+        // Valid extension
+        assert!(validate_expiry_extension(&env, &session, 150).is_ok());
+
+        // Max duration boundary: 50 + MAX_SESSION_DURATION_LEDGERS
+        assert!(
+            validate_expiry_extension(&env, &session, 50 + MAX_SESSION_DURATION_LEDGERS).is_ok()
+        );
+
+        // Exceeds max duration
+        assert_eq!(
+            validate_expiry_extension(&env, &session, 50 + MAX_SESSION_DURATION_LEDGERS + 1),
+            Err(ContractError::SessionDurationTooLong)
+        );
+
+        // Not later (equal to current session expiry)
+        assert_eq!(
+            validate_expiry_extension(&env, &session, 100),
+            Err(ContractError::ExpiredSession)
+        );
+
+        // Not later (earlier than current session expiry)
+        assert_eq!(
+            validate_expiry_extension(&env, &session, 90),
+            Err(ContractError::ExpiredSession)
+        );
+
+        // Current ledger reached or passed session expiry
+        env.ledger().set_sequence_number(100);
+        assert_eq!(
+            validate_expiry_extension(&env, &session, 150),
+            Err(ContractError::ExpiredSession)
         );
     }
 }

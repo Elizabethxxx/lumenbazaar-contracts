@@ -88,3 +88,18 @@ pub struct BatchRecoveryResult {
     pub status: BatchRecoveryStatus,
     pub refunded_amount: i128,
 }
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum BatchSessionStatus {
+    Found(Session),
+    NotFound,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchSessionResult {
+    pub session_id: BytesN<32>,
+    pub status: BatchSessionStatus,
+}

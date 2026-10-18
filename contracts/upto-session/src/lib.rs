@@ -10,7 +10,8 @@ pub mod validation;
 pub use errors::ContractError;
 pub use types::{
     AdminRotation, AssetPolicy, AssetStatus, BatchRecoveryResult, BatchRecoveryStatus,
-    ContractConfiguration, OperationalState, Session, SessionStatus,
+    BatchSessionResult, BatchSessionStatus, ContractConfiguration, OperationalState, Session,
+    SessionStatus,
 };
 
 use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env, Vec};
@@ -22,6 +23,7 @@ pub const INTERFACE_VERSION: u32 = 3;
 pub const CONFIGURATION_RESPONSE_VERSION: u32 = 1;
 pub const MAX_SUPPORTED_ASSETS: u32 = 16;
 pub const MAX_RECOVERY_BATCH_SIZE: u32 = 8;
+pub const MAX_SESSION_QUERY_BATCH_SIZE: u32 = 8;
 
 #[contractimpl]
 impl UptoSessionContract {
@@ -487,6 +489,62 @@ impl UptoSessionContract {
 
     pub fn get_session(env: Env, session_id: BytesN<32>) -> Result<Session, ContractError> {
         storage::read_session(&env, &session_id).ok_or(ContractError::SessionNotFound)
+    }
+
+    pub fn get_session_batch(
+        env: Env,
+        session_ids: Vec<BytesN<32>>,
+    ) -> Result<Vec<BatchSessionResult>, ContractError> {
+        if session_ids.is_empty() || session_ids.len() > MAX_SESSION_QUERY_BATCH_SIZE {
+            return Err(ContractError::InvalidBatchSize);
+        }
+
+        let mut results = Vec::new(&env);
+        for session_id in session_ids.iter() {
+            let status = match storage::read_session(&env, &session_id) {
+                Some(session) => BatchSessionStatus::Found(session),
+                None => BatchSessionStatus::NotFound,
+            };
+            results.push_back(BatchSessionResult { session_id, status });
+        }
+
+        Ok(results)
+    }
+
+    pub fn extend_session_expiry(
+        env: Env,
+        session_id: BytesN<32>,
+        new_expires_at_ledger: u32,
+    ) -> Result<(), ContractError> {
+        let mut session =
+            storage::read_session(&env, &session_id).ok_or(ContractError::SessionNotFound)?;
+
+        match &session.status {
+            SessionStatus::Open => {}
+            SessionStatus::Settled => return Err(ContractError::SessionAlreadySettled),
+            SessionStatus::Cancelled => return Err(ContractError::SessionCancelled),
+            SessionStatus::Expired => return Err(ContractError::SessionExpired),
+        }
+
+        validation::validate_expiry_extension(&env, &session, new_expires_at_ledger)?;
+
+        session.buyer.require_auth();
+        session.seller.require_auth();
+
+        let previous_expires_at_ledger = session.expires_at_ledger;
+        session.expires_at_ledger = new_expires_at_ledger;
+        storage::write_session(&env, &session);
+
+        events::publish_session_expiry_extended(
+            &env,
+            &session_id,
+            &session.buyer,
+            &session.seller,
+            previous_expires_at_ledger,
+            new_expires_at_ledger,
+        );
+
+        Ok(())
     }
 
     pub fn get_escrow_liability(env: Env, asset: Address) -> Result<i128, ContractError> {

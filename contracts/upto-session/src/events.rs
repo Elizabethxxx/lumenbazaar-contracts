@@ -108,6 +108,17 @@ pub struct SessionRecovered {
     pub recovered_at_ledger: u32,
 }
 
+#[contractevent]
+pub struct SessionExpiryExtended {
+    #[topic]
+    pub session_id: BytesN<32>,
+    pub buyer: Address,
+    pub seller: Address,
+    pub previous_expires_at_ledger: u32,
+    pub new_expires_at_ledger: u32,
+    pub event_version: u32,
+}
+
 pub fn publish_session_created(env: &Env, session: &Session) {
     SessionCreated {
         session_id: session.id.clone(),
@@ -251,6 +262,25 @@ pub fn publish_session_recovered(env: &Env, session: &Session, refunded_amount: 
         refunded_amount,
         expired_at_ledger: session.expires_at_ledger,
         recovered_at_ledger: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+pub fn publish_session_expiry_extended(
+    env: &Env,
+    session_id: &BytesN<32>,
+    buyer: &Address,
+    seller: &Address,
+    previous_expires_at_ledger: u32,
+    new_expires_at_ledger: u32,
+) {
+    SessionExpiryExtended {
+        session_id: session_id.clone(),
+        buyer: buyer.clone(),
+        seller: seller.clone(),
+        previous_expires_at_ledger,
+        new_expires_at_ledger,
+        event_version: 2,
     }
     .publish(env);
 }
